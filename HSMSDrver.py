@@ -1,30 +1,13 @@
 import sys
 import asyncio
 import struct
-import json
-import logging
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidget, QTableWidgetItem, QTextEdit, QLabel, QHeaderView,
-                             QLineEdit, QGroupBox, QFormLayout, QPushButton)
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+                             QLineEdit, QGroupBox, QFormLayout, QPushButton, QComboBox)
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, pyqtSlot
 
-# --- [1. SECS-II 기초 인코더] ---
-class SECS2:
-    LIST, ASCII, I4 = 0x00, 0x10, 0x70
-    @staticmethod
-    def encode_item(item_type, data):
-        if item_type == SECS2.ASCII:
-            encoded = data.encode('ascii')
-            return struct.pack("BB", item_type | 1, len(encoded)) + encoded
-        elif item_type == SECS2.I4:
-            return struct.pack("BB i", item_type | 1, 4, data)
-        elif item_type == SECS2.LIST:
-            combined = b''.join(data)
-            return struct.pack("BB", item_type | 1, len(data)) + combined
-        return b''
-
-# --- [2. HSMS 헤더 구조체] ---
+# --- [HSMS 기초 구조체 및 프로토콜은 이전 버전과 동일하므로 생략 없이 포함] ---
 class HSMSHeader:
     def __init__(self, stream=0, function=0, s_type=0, system_bytes=0):
         self.stream, self.function, self.s_type = stream, function, s_type
@@ -36,52 +19,6 @@ class HSMSHeader:
         h = struct.unpack(">HBBBBI", data)
         return cls(stream=h[1], function=h[2], s_type=h[4], system_bytes=h[5])
 
-# --- [3. 개별 접속 인스턴스 및 자동 재접속] ---
-class HSMSInstance(QObject):
-    status_changed = pyqtSignal(str, str)
-    def __init__(self, name, host, port, params=None):
-        super().__init__()
-        self.name, self.host, self.port = name, host, port
-        self.transport = None
-        self.is_selected = False
-        self._pending_tx = {}
-        self._sys_byte = 0
-        p = params or {}
-        self.T3 = float(p.get('T3', 45.0))
-        self.T5 = float(p.get('T5', 10.0))
-        self.T6 = float(p.get('T6', 5.0))
-
-    async def connect_loop(self):
-        while True:
-            try:
-                self.status_changed.emit(self.name, "CONNECTING")
-                loop = asyncio.get_running_loop()
-                # T5: Connect Timeout 적용
-                self.transport, _ = await asyncio.wait_for(
-                    loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), timeout=self.T5)
-                
-                # Select.req (T6 적용)
-                resp, _ = await self._send_raw(HSMSHeader(s_type=1), timeout=self.T6)
-                if resp.s_type == 2:
-                    self.is_selected = True
-                    self.status_changed.emit(self.name, "SELECTED")
-                    while self.is_selected: await asyncio.sleep(1)
-            except Exception:
-                self.is_selected = False
-                self.status_changed.emit(self.name, "RETRYING(5s)")
-                await asyncio.sleep(5)
-
-    async def _send_raw(self, header, payload=b'', timeout=45.0):
-        self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
-        header.system_bytes = self._sys_byte
-        future = asyncio.get_running_loop().create_future()
-        self._pending_tx[self._sys_byte] = future
-        if self.transport:
-            msg = header.pack() + payload
-            self.transport.write(struct.pack(">I", len(msg)) + msg)
-        return await asyncio.wait_for(future, timeout)
-
-# --- [4. 프로토콜 핸들러] ---
 class HSMSProtocol(asyncio.Protocol):
     def __init__(self, instance):
         self.instance = instance
@@ -97,127 +34,227 @@ class HSMSProtocol(asyncio.Protocol):
             if header.system_bytes in self.instance._pending_tx:
                 self.instance._pending_tx.pop(header.system_bytes).set_result((header, raw[10:]))
 
-# --- [5. 세션 매니저 (에러 원인 해결을 위해 상단 배치)] ---
-class HSMSManager:
-    def __init__(self):
-        self.sessions = {}
-    def add_session(self, name, host, port, params=None):
-        self.sessions[name] = HSMSInstance(name, host, port, params)
-
-# --- [6. 백그라운드 비동기 워커] ---
-class HSMSWorker(QThread):
-    status_signal = pyqtSignal(str, str)
-    def __init__(self, manager):
+# --- [HSMS 개별 인스턴스: 개별 시작/중지 로직 추가] ---
+class HSMSInstance(QObject):
+    status_changed = pyqtSignal(str, str)
+    def __init__(self, name, host, port, params=None):
         super().__init__()
-        self.manager = manager
-    def run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        for s in self.manager.sessions.values():
-            s.status_changed.connect(self.status_signal.emit)
-        tasks = [s.connect_loop() for s in self.manager.sessions.values()]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        self.name, self.host, self.port = name, host, port
+        self.params = params or {'T3': 45.0, 'T5': 10.0, 'T6': 5.0}
+        self.transport = None
+        self.running = False
+        self._pending_tx = {}
+        self._sys_byte = 0
 
-# --- [7. 메인 GUI 모니터링 및 설정 창] ---
+    async def run_task(self):
+        self.running = True
+        while self.running:
+            try:
+                self.status_changed.emit(self.name, "CONNECTING")
+                loop = asyncio.get_running_loop()
+                self.transport, _ = await asyncio.wait_for(
+                    loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), 
+                    timeout=self.params['T5'])
+                
+                resp, _ = await self._send_raw(HSMSHeader(s_type=1), timeout=self.params['T6'])
+                if resp.s_type == 2:
+                    self.status_changed.emit(self.name, "SELECTED")
+                    while self.running and not self.transport.is_closing():
+                        await asyncio.sleep(1)
+            except Exception:
+                if self.running:
+                    self.status_changed.emit(self.name, "RETRYING(5s)")
+                    await asyncio.sleep(5)
+        
+        if self.transport:
+            self.transport.close()
+        self.status_changed.emit(self.name, "STOPPED")
+
+    async def _send_raw(self, header, payload=b'', timeout=45.0):
+        self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
+        header.system_bytes = self._sys_byte
+        future = asyncio.get_running_loop().create_future()
+        self._pending_tx[self._sys_byte] = future
+        if self.transport:
+            msg = header.pack() + payload
+            self.transport.write(struct.pack(">I", len(msg)) + msg)
+        return await asyncio.wait_for(future, timeout)
+
+# --- [통합 GUI 매니저] ---
 class HSMSMonitorApp(QMainWindow):
-    def __init__(self, manager):
+    def __init__(self):
         super().__init__()
-        self.manager = manager
-        self.config_path = "hsms_config.json"
+        self.sessions = {}
+        self.tasks = {}
+        self.loop = None
         self.init_ui()
-        self.load_config_file()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Multi-Session Master v1.3.2")
-        self.resize(1100, 650)
+        self.setWindowTitle("HSMS Multi-Node Controller v1.5.0")
+        self.resize(1200, 700)
+        
         main_layout = QHBoxLayout()
         
-        # 좌측 설정 패널
-        left_panel = QGroupBox("Configuration")
+        # --- 왼쪽: 설정 및 제어 패널 ---
+        left_panel = QVBoxLayout()
+        config_group = QGroupBox("Node Configuration")
         form = QFormLayout()
-        self.ui_name = QLineEdit("EQP_01")
-        self.ui_host = QLineEdit("127.0.0.1")
-        self.ui_port = QLineEdit("5000")
-        self.ui_t3 = QLineEdit("45")
-        self.ui_t6 = QLineEdit("5")
-        btn_apply = QPushButton("Apply & Save Config")
-        btn_apply.clicked.connect(self.save_and_apply)
         
-        form.addRow("Name:", self.ui_name)
-        form.addRow("IP Address:", self.ui_host)
-        form.addRow("Port:", self.ui_port)
-        form.addRow("T3 Timeout:", self.ui_t3)
-        form.addRow("T6 Timeout:", self.ui_t6)
+        self.combo_nodes = QComboBox()
+        self.combo_nodes.addItem("--- New Node ---")
+        self.combo_nodes.currentIndexChanged.connect(self.on_node_selected)
+        
+        self.in_name = QLineEdit()
+        self.in_host = QLineEdit("127.0.0.1")
+        self.in_port = QLineEdit("5000")
+        self.in_t3 = QLineEdit("45")
+        self.in_t6 = QLineEdit("5")
+        
+        btn_apply = QPushButton("Apply & Update Node")
+        btn_apply.clicked.connect(self.apply_node_config)
+        
+        form.addRow("Select Node:", self.combo_nodes)
+        form.addRow("Node Name:", self.in_name)
+        form.addRow("Host IP:", self.in_host)
+        form.addRow("Port:", self.in_port)
+        form.addRow("T3 Timeout:", self.in_t3)
+        form.addRow("T6 Timeout:", self.in_t6)
         form.addRow(btn_apply)
-        left_panel.setLayout(form)
-        left_panel.setFixedWidth(280)
+        config_group.setLayout(form)
+        
+        control_group = QGroupBox("Communication Control")
+        ctrl_layout = QHBoxLayout()
+        self.btn_start = QPushButton("START")
+        self.btn_stop = QPushButton("STOP")
+        self.btn_start.clicked.connect(self.start_comm)
+        self.btn_stop.clicked.connect(self.stop_comm)
+        self.btn_start.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold;")
+        self.btn_stop.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        ctrl_layout.addWidget(self.btn_start)
+        ctrl_layout.addWidget(self.btn_stop)
+        control_group.setLayout(ctrl_layout)
+        
+        left_panel.addWidget(config_group)
+        left_panel.addWidget(control_group)
+        left_panel.addStretch()
 
-        # 우측 모니터링 패널
+        # --- 오른쪽: 그리드 및 로그 ---
         right_panel = QVBoxLayout()
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "Address", "Status", "Params"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Name", "Address", "Status", "T3", "T6", "Last Update"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background-color: #1e1e1e; color: #00ff00;")
-
-        right_panel.addWidget(QLabel("### Connection Dashboard"))
+        self.log_view.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
+        
+        right_panel.addWidget(QLabel("### Multi-Node Monitoring Grid"))
         right_panel.addWidget(self.table)
-        right_panel.addWidget(QLabel("### System Activity Log"))
+        right_panel.addWidget(QLabel("### System Event Logs"))
         right_panel.addWidget(self.log_view)
-
-        main_layout.addWidget(left_panel)
-        main_layout.addLayout(right_panel)
+        
+        main_layout.addLayout(left_panel, 1)
+        main_layout.addLayout(right_panel, 3)
+        
         container = QWidget()
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-    def save_and_apply(self):
-        name = self.ui_name.text()
-        config = {
-            "host": self.ui_host.text(),
-            "port": int(self.ui_port.text()),
-            "T3": float(self.ui_t3.text()),
-            "T6": float(self.ui_t6.text())
-        }
-        # 여기에 실제 JSON 파일 쓰기 로직 추가 가능
-        self.add_session_to_ui(name, config)
-        self.log_view.append(f"[System] Config applied for {name}")
+    # --- 제어 로직 ---
+    def on_node_selected(self, index):
+        if index == 0: # New Node
+            self.in_name.setText("")
+            self.in_name.setReadOnly(False)
+        else:
+            name = self.combo_nodes.currentText()
+            inst = self.sessions[name]
+            self.in_name.setText(name)
+            self.in_name.setReadOnly(True)
+            self.in_host.setText(inst.host)
+            self.in_port.setText(str(inst.port))
+            self.in_t3.setText(str(inst.params['T3']))
+            self.in_t6.setText(str(inst.params['T6']))
 
-    def add_session_to_ui(self, name, cfg):
-        if name not in self.manager.sessions:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-            self.table.setItem(row, 1, QTableWidgetItem(f"{cfg['host']}:{cfg['port']}"))
-            self.table.setItem(row, 2, QTableWidgetItem("IDLE"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"T3:{cfg['T3']} T6:{cfg['T6']}"))
-            self.manager.add_session(name, cfg['host'], cfg['port'], cfg)
+    def apply_node_config(self):
+        name = self.in_name.text()
+        if not name: return
+        
+        params = {'T3': float(self.in_t3.text()), 'T5': 10.0, 'T6': float(self.in_t6.text())}
+        
+        if name not in self.sessions:
+            inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), params)
+            inst.status_changed.connect(self.update_grid_status)
+            self.sessions[name] = inst
+            self.combo_nodes.addItem(name)
+            self.add_grid_row(name, inst)
+        else:
+            inst = self.sessions[name]
+            inst.host = self.in_host.text()
+            inst.port = int(self.in_port.text())
+            inst.params = params
+            self.update_grid_row(name, inst)
+            
+        self.log_view.append(f"[System] Node '{name}' configuration updated.")
 
-    def update_status_ui(self, name, status):
+    def add_grid_row(self, name, inst):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(name))
+        self.table.setItem(row, 1, QTableWidgetItem(f"{inst.host}:{inst.port}"))
+        self.table.setItem(row, 2, QTableWidgetItem("IDLE"))
+        self.table.setItem(row, 3, QTableWidgetItem(str(inst.params['T3'])))
+        self.table.setItem(row, 4, QTableWidgetItem(str(inst.params['T6'])))
+        self.table.setItem(row, 5, QTableWidgetItem("-"))
+
+    def update_grid_row(self, name, inst):
+        for i in range(self.table.rowCount()):
+            if self.table.item(i, 0).text() == name:
+                self.table.item(i, 1).setText(f"{inst.host}:{inst.port}")
+                self.table.item(i, 3).setText(str(inst.params['T3']))
+                self.table.item(i, 4).setText(str(inst.params['T6']))
+
+    def update_grid_status(self, name, status):
         for i in range(self.table.rowCount()):
             if self.table.item(i, 0).text() == name:
                 self.table.item(i, 2).setText(status)
+                self.table.item(i, 5).setText(datetime.now().strftime("%H:%M:%S"))
         self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {name}: {status}")
 
-    def load_config_file(self):
-        # 초기 기본값 로드 예시
-        default_cfg = {"host": "127.0.0.1", "port": 5000, "T3": 45.0, "T6": 5.0}
-        self.add_session_to_ui("EQP_INIT", default_cfg)
+    def start_comm(self):
+        name = self.in_name.text()
+        if name in self.sessions and not self.sessions[name].running:
+            self.tasks[name] = asyncio.run_coroutine_threadsafe(self.sessions[name].run_task(), self.loop)
+            self.log_view.append(f"[Control] Starting communication for {name}...")
 
-# --- [8. 메인 진입점] ---
-def main():
-    app = QApplication(sys.argv)
-    manager = HSMSManager()
-    monitor = HSMSMonitorApp(manager)
-    
-    worker = HSMSWorker(manager)
-    worker.status_signal.connect(monitor.update_status_ui)
-    worker.start()
-    
-    monitor.show()
-    sys.exit(app.exec())
+    def stop_comm(self):
+        name = self.in_name.text()
+        if name in self.sessions:
+            self.sessions[name].running = False
+            self.log_view.append(f"[Control] Stopping communication for {name}...")
+
+# --- [비동기 루프 스레드] ---
+class AsyncLoopThread(QThread):
+    def __init__(self):
+        super().__init__()
+        self.loop = None
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
 if __name__ == "__main__":
-    main()
-
+    app = QApplication(sys.argv)
+    
+    # 비동기 루프를 별도 스레드에서 상시 실행
+    async_thread = AsyncLoopThread()
+    async_thread.start()
+    
+    # 0.1초 정도 대기하여 루프가 생성되도록 함
+    import time
+    while async_thread.loop is None: time.sleep(0.1)
+    
+    window = HSMSMonitorApp()
+    window.loop = async_thread.loop
+    window.show()
+    
+    sys.exit(app.exec())
