@@ -1,1 +1,145 @@
+import asyncio
+import struct
+import logging
+import sys
+from datetime import datetime
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QTableWidget, QTableWidgetItem, 
+                             QPushButton, QTextEdit, QLabel, QHeaderView)
+from PyQt6.QtCore import QTimer, pyqtSignal, QObject
+
+# --- Logger 설정 ---
+def get_logger(name):
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        file_handler = logging.FileHandler(f"{name}_{datetime.now().strftime('%Y%m%d')}.log")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger
+
+# --- HSMS Driver Logic (v1.2.0: Auto-Reconnect 추가) ---
+class HSMSInstance(QObject):
+    status_changed = pyqtSignal(str, str) # 세션명, 상태
+
+    def __init__(self, name, host, port):
+        super().__init__()
+        self.name, self.host, self.port = name, host, port
+        self.transport = None
+        self.is_selected = False
+        self.logger = get_logger(name)
+        self._pending_tx = {}
+        self._sys_byte = 0
+
+    async def connect_loop(self):
+        """무한 재접속 루프"""
+        while True:
+            try:
+                self.status_changed.emit(self.name, "CONNECTING")
+                self.logger.info(f"Connecting to {self.host}:{self.port}")
+                
+                loop = asyncio.get_running_loop()
+                self.transport, _ = await loop.create_connection(
+                    lambda: HSMSProtocol(self), self.host, self.port)
+                
+                # Select Procedure
+                header = HSMSHeader(s_type=1)
+                resp, _ = await self._send_raw(header, timeout=5.0)
+                
+                if resp.s_type == 2:
+                    self.is_selected = True
+                    self.status_changed.emit(self.name, "SELECTED")
+                    self.logger.info("HSMS Selected.")
+                    # 연결 유지 감시 (Linktest 등은 별도 Task로 실행 가능)
+                    while self.is_selected:
+                        await asyncio.sleep(1)
+            except Exception as e:
+                self.is_selected = False
+                self.status_changed.emit(self.name, "FAULT/RETRY")
+                self.logger.error(f"Connection Error: {e}")
+                await asyncio.sleep(5) # 5초 후 재시도
+
+    async def _send_raw(self, header, payload=b'', timeout=45.0):
+        self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
+        header.system_bytes = self._sys_byte
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending_tx[self._sys_byte] = future
+        
+        msg = header.pack() + payload
+        self.transport.write(struct.pack(">I", len(msg)) + msg)
+        return await asyncio.wait_for(future, timeout)
+
+# --- GUI Monitoring Window ---
+class HSMSMonitorApp(QMainWindow):
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+        self.setWindowTitle("SEMI E37 HSMS Multi-Session Monitor v1.2.0")
+        self.resize(1000, 600)
+        
+        # UI 레이아웃
+        main_layout = QVBoxLayout()
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Session Name", "IP:Port", "Status", "Last Event"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
+
+        main_layout.addWidget(QLabel("### Connection Status"))
+        main_layout.addWidget(self.table)
+        main_layout.addWidget(QLabel("### System Logs"))
+        main_layout.addWidget(self.log_view)
+        
+        container = QWidget()
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
+
+    def update_status(self, name, status):
+        # 테이블에서 해당 세션 찾아서 상태 업데이트
+        for i in range(self.table.rowCount()):
+            if self.table.item(i, 0).text() == name:
+                item = self.table.item(i, 2)
+                item.setText(status)
+                # 상태별 색상 변경
+                if status == "SELECTED": item.setBackground(logging.getColorName(30)) # Green 대체 로직 필요
+                self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {name} changed to {status}")
+
+    def add_session_to_table(self, name, host, port):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(name))
+        self.table.setItem(row, 1, QTableWidgetItem(f"{host}:{port}"))
+        self.table.setItem(row, 2, QTableWidgetItem("IDLE"))
+        self.table.setItem(row, 3, QTableWidgetItem("-"))
+
+# --- 실행부 (Asyncio + PyQt6 통합) ---
+async def run_gui_and_logic():
+    qapp = QApplication(sys.argv)
+    
+    manager = HSMSManager() # 이전 버전의 Manager 활용
+    monitor = HSMSMonitorApp(manager)
+    
+    # 세션 추가 및 GUI 연동
+    eqps = [("EQP_01", "127.0.0.1", 5000), ("EQP_02", "127.0.0.1", 5001)]
+    tasks = []
+    
+    for name, host, port in eqps:
+        inst = HSMSInstance(name, host, port)
+        inst.status_changed.connect(monitor.update_status)
+        monitor.add_session_to_table(name, host, port)
+        tasks.append(inst.connect_loop())
+        
+    monitor.show()
+    
+    # PyQt6와 asyncio 이벤트 루프 통합
+    while True:
+        qapp.processEvents()
+        await asyncio.sleep(0.01)
+
+if __name__ == "__main__":
+    asyncio.run(run_gui_and_logic())
 
