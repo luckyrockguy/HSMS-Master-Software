@@ -1,4 +1,4 @@
-[import sys
+import sys
 import asyncio
 import struct
 from datetime import datetime
