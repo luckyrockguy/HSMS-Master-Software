@@ -204,7 +204,7 @@ class HSMSMonitorApp(QMainWindow):
         header_h.addWidget(QLabel("Function (F):")); header_h.addWidget(self.in_f)
         
         self.in_payload = QTextEdit(); self.in_payload.setPlaceholderText("Enter Payload Data (Hex or Text)...")
-        self.in_payload.setMaximumHeight(150); # 높이 증가
+        self.in_payload.setMaximumHeight(250); # 높이 증가
         
         btn_send = QPushButton("SEND SECS MESSAGE"); btn_send.setStyleSheet("background:#27ae60; color:white; font-weight:bold; height:40px;")
         btn_send.clicked.connect(self.send_message_action)
