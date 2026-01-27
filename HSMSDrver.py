@@ -7,12 +7,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QComboBox, QRadioButton, QGridLayout, QFrame)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt
 
-# --- [1. HSMS Header & Logic] ---
+# --- [1. HSMS Header & Protocol] ---
 class HSMSHeader:
     def __init__(self, stream=0, function=0, s_type=0, system_bytes=0):
         self.stream = stream
         self.function = function
-        self.s_type = s_type # 0:Data, 1:Select.req, 2:Select.rsp, 5:Linktest.req, 6:Linktest.rsp
+        self.s_type = s_type # 0:Data, 1:Select.req, 2:Select.rsp, 5:Linktest.req...
         self.system_bytes = system_bytes
 
     def pack(self):
@@ -31,7 +31,7 @@ class HSMSProtocol(asyncio.Protocol):
     def connection_made(self, transport):
         self.instance.transport = transport
         self.instance.status_changed.emit(self.instance.name, "NOT SELECTED")
-        self.instance.log_signal.emit(f"SYSTEM | Connection Established")
+        self.instance.log_signal.emit(f"SYSTEM | Connected to peer")
 
     def data_received(self, data):
         self.buf.extend(data)
@@ -41,26 +41,25 @@ class HSMSProtocol(asyncio.Protocol):
             raw = self.buf[4:4+length]
             self.buf = self.buf[4+length:]
             header = HSMSHeader.unpack(raw[:10])
-            payload = raw[10:]
             
-            # --- Passive Mode: Handling Select.req ---
-            if header.s_type == 1: # Select.req
-                self.instance.log_signal.emit(f"RECV | Select.req (Passive Mode)")
+            # Passive 모드: Select.req 자동 응답
+            if header.s_type == 1:
+                self.instance.log_signal.emit("RECV | Select.req")
                 rsp = HSMSHeader(s_type=2, system_bytes=header.system_bytes)
                 self.instance.send_control_message(rsp)
                 self.instance.status_changed.emit(self.instance.name, "SELECTED")
             
-            # --- Handling Data or Responses ---
-            desc = f"S{header.stream}F{header.function}" if header.s_type == 0 else f"Type:{header.s_type}"
-            self.instance.log_signal.emit(f"RECV | {desc} | Sys:{header.system_bytes}")
+            # SECS 데이터 메시지(Type 0) 처리
+            msg_type = f"S{header.stream}F{header.function}" if header.s_type == 0 else f"Control(Type:{header.s_type})"
+            self.instance.log_signal.emit(f"RECV | {msg_type} | SysBytes:{header.system_bytes}")
             
             if header.system_bytes in self.instance._pending_tx:
-                self.instance._pending_tx.pop(header.system_bytes).set_result((header, payload))
+                self.instance._pending_tx.pop(header.system_bytes).set_result((header, raw[10:]))
 
     def connection_lost(self, exc):
         self.instance.transport = None
         self.instance.status_changed.emit(self.instance.name, "NOT CONNECTED")
-        self.instance.log_signal.emit(f"SYSTEM | Connection Lost")
+        self.instance.log_signal.emit("SYSTEM | Connection Lost")
 
 # --- [2. HSMS Instance] ---
 class HSMSInstance(QObject):
@@ -70,8 +69,9 @@ class HSMSInstance(QObject):
     def __init__(self, name, host, port, mode="Active", params=None):
         super().__init__()
         self.name, self.host, self.port, self.mode = name, host, port, mode
-        self.params = params or {'T3': 45.0, 'T5': 10.0, 'T6': 5.0}
+        self.params = params or {'T3': 45.0, 'T5': 10.0, 'T6': 5.0, 'T7': 10.0, 'T8': 5.0}
         self.transport = None
+        self.server = None
         self.running = False
         self._pending_tx = {}
         self._sys_byte = 0
@@ -81,19 +81,18 @@ class HSMSInstance(QObject):
         if self.transport:
             msg = header.pack()
             self.transport.write(struct.pack(">I", len(msg)) + msg)
-            self.log_signal.emit(f"SEND | Type:{header.s_type} (Control)")
+            self.log_signal.emit(f"SEND | Control(Type:{header.s_type})")
 
     async def send_data_message(self, s, f, payload=b''):
         header = HSMSHeader(stream=s, function=f, s_type=0)
         self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
         header.system_bytes = self._sys_byte
-        
         if self.transport:
             full_msg = header.pack() + payload
             self.transport.write(struct.pack(">I", len(full_msg)) + full_msg)
-            self.log_signal.emit(f"SEND | S{s}F{f} | Sys:{self._sys_byte}")
+            self.log_signal.emit(f"SEND | S{s}F{f} | SysBytes:{self._sys_byte}")
         else:
-            self.log_signal.emit("ERROR | Not Connected")
+            self.log_signal.emit("ERROR | No Active Connection")
 
     async def run_task(self):
         self.running = True
@@ -103,9 +102,10 @@ class HSMSInstance(QObject):
                 if self.mode == "Active":
                     self.status_changed.emit(self.name, "NOT CONNECTED")
                     self.transport, _ = await asyncio.wait_for(
-                        loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), timeout=self.params['T5'])
+                        loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), 
+                        timeout=self.params['T5'])
                     
-                    # Active: Send Select.req
+                    # Active: Select.req 송신
                     resp, _ = await self._send_with_wait(HSMSHeader(s_type=1), timeout=self.params['T6'])
                     if resp.s_type == 2:
                         self.status_changed.emit(self.name, "SELECTED")
@@ -113,14 +113,13 @@ class HSMSInstance(QObject):
                             await asyncio.sleep(0.5)
                 else: # Passive Mode
                     self.status_changed.emit(self.name, "NOT CONNECTED")
-                    server = await loop.create_server(lambda: HSMSProtocol(self), '0.0.0.0', self.port)
-                    async with server: 
-                        self.log_signal.emit(f"SYSTEM | Passive Listening on {self.port}...")
-                        await server.serve_forever()
+                    self.server = await loop.create_server(lambda: HSMSProtocol(self), '0.0.0.0', self.port)
+                    async with self.server:
+                        await self.server.serve_forever()
             except Exception as e:
                 if self.running:
                     self.status_changed.emit(self.name, "NOT CONNECTED")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(self.params['T5'])
         self.status_changed.emit(self.name, "STOPPED")
 
     async def _send_with_wait(self, header, timeout=10.0):
@@ -132,6 +131,11 @@ class HSMSInstance(QObject):
         self.transport.write(struct.pack(">I", len(msg)) + msg)
         return await asyncio.wait_for(future, timeout)
 
+    def stop(self):
+        self.running = False
+        if self.transport: self.transport.close()
+        if self.server: self.server.close()
+
 # --- [3. Main UI] ---
 class HSMSMonitorApp(QMainWindow):
     def __init__(self, loop):
@@ -142,12 +146,11 @@ class HSMSMonitorApp(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Messenger v2.2.0")
-        self.resize(1100, 800)
-        
+        self.setWindowTitle("HSMS Master v2.3.0 - Protocol Analyzer")
+        self.resize(1200, 900)
         main_layout = QHBoxLayout()
         
-        # --- Left Panel: Settings ---
+        # --- Left Panel: Config & State ---
         left_panel = QVBoxLayout()
         
         cfg_box = QGroupBox("Node Setting")
@@ -155,74 +158,88 @@ class HSMSMonitorApp(QMainWindow):
         self.combo_nodes = QComboBox()
         self.combo_nodes.addItem("--- New Node ---")
         self.combo_nodes.currentIndexChanged.connect(self.on_node_selected)
-        
         self.in_name, self.in_host, self.in_port = QLineEdit(), QLineEdit("127.0.0.1"), QLineEdit("5000")
         self.rb_act, self.rb_pas = QRadioButton("Active"), QRadioButton("Passive")
         self.rb_act.setChecked(True)
         mode_h = QHBoxLayout(); mode_h.addWidget(self.rb_act); mode_h.addWidget(self.rb_pas)
-        
-        f_lay.addRow("Select:", self.combo_nodes)
-        f_lay.addRow("Name:", self.in_name)
-        f_lay.addRow("Mode:", mode_h)
-        f_lay.addRow("IP/Port:", self.in_host); f_lay.addRow("", self.in_port)
+        f_lay.addRow("Select:", self.combo_nodes); f_lay.addRow("Name:", self.in_name)
+        f_lay.addRow("Mode:", mode_h); f_lay.addRow("IP/Port:", self.in_host); f_lay.addRow("", self.in_port)
         cfg_box.setLayout(f_lay)
 
-        # Status Model UI (Left Bottom)
-        self.state_box = QGroupBox("SEMI E37 Connection State")
+        t_box = QGroupBox("Time-Out Parameters (SEMI E37)")
+        t_lay = QGridLayout()
+        self.t_inputs = {k: QLineEdit(str(v)) for k, v in {'T3':45, 'T5':10, 'T6':5, 'T7':10, 'T8':5}.items()}
+        for i, (k, widget) in enumerate(self.t_inputs.items()):
+            t_lay.addWidget(QLabel(f"{k}:"), i//2, (i%2)*2)
+            t_lay.addWidget(widget, i//2, (i%2)*2 + 1)
+        t_box.setLayout(t_lay)
+
+        # Status Model
+        self.state_box = QGroupBox("SEMI E37 State")
         st_lay = QVBoxLayout()
-        self.st_nc = self._st_lbl("NOT CONNECTED")
-        self.st_ns = self._st_lbl("CONNECTED / NOT SELECTED")
-        self.st_sl = self._st_lbl("CONNECTED / SELECTED")
+        self.st_nc, self.st_ns, self.st_sl = self._st_lbl("NOT CONNECTED"), self._st_lbl("NOT SELECTED"), self._st_lbl("SELECTED")
         st_lay.addWidget(self.st_nc); st_lay.addWidget(QLabel("↓↑", alignment=Qt.AlignmentFlag.AlignCenter))
         st_lay.addWidget(self.st_ns); st_lay.addWidget(QLabel("↓↑", alignment=Qt.AlignmentFlag.AlignCenter))
         st_lay.addWidget(self.st_sl)
         self.state_box.setLayout(st_lay)
 
-        btn_apply = QPushButton("Apply & Save Node")
+        btn_apply = QPushButton("Apply Configuration")
         btn_apply.clicked.connect(self.apply_node)
-        btn_start = QPushButton("START COMMUNICATION"); btn_start.setStyleSheet("background:#2980b9; color:white; font-weight:bold;")
+        btn_start = QPushButton("COMM START"); btn_start.setStyleSheet("background:#2980b9; color:white; font-weight:bold; height:35px;")
         btn_start.clicked.connect(self.start_comm)
+        btn_stop = QPushButton("COMM STOP"); btn_stop.setStyleSheet("background:#c0392b; color:white; font-weight:bold; height:35px;")
+        btn_stop.clicked.connect(self.stop_comm)
         
-        left_panel.addWidget(cfg_box); left_panel.addWidget(btn_apply)
-        left_panel.addWidget(btn_start); left_panel.addWidget(self.state_box)
-        left_panel.addStretch()
+        left_panel.addWidget(cfg_box); left_panel.addWidget(t_box); left_panel.addWidget(btn_apply)
+        left_panel.addWidget(btn_start); left_panel.addWidget(btn_stop); left_panel.addWidget(self.state_box); left_panel.addStretch()
 
-        # --- Right Panel: Messenger & Logs ---
+        # --- Right Panel: Messaging & Log ---
         right_panel = QVBoxLayout()
         
-        # Send Message Area
         send_group = QGroupBox("Message Transmission")
-        s_lay = QGridLayout()
-        self.in_stream = QLineEdit("1"); self.in_stream.setPlaceholderText("S")
-        self.in_func = QLineEdit("1"); self.in_func.setPlaceholderText("F")
-        self.in_payload = QLineEdit(); self.in_payload.setPlaceholderText("Payload (Hex string or Text)")
-        btn_send = QPushButton("SEND MESSAGE"); btn_send.setStyleSheet("background:#27ae60; color:white; height:40px; font-weight:bold;")
+        s_lay = QVBoxLayout()
+        header_h = QHBoxLayout()
+        self.in_s, self.in_f = QLineEdit("1"), QLineEdit("1")
+        header_h.addWidget(QLabel("Stream (S):")); header_h.addWidget(self.in_s)
+        header_h.addWidget(QLabel("Function (F):")); header_h.addWidget(self.in_f)
+        
+        self.in_payload = QTextEdit(); self.in_payload.setPlaceholderText("Enter Payload Data (Hex or Text)...")
+        self.in_payload.setMaximumHeight(150); # 높이 증가
+        
+        btn_send = QPushButton("SEND SECS MESSAGE"); btn_send.setStyleSheet("background:#27ae60; color:white; font-weight:bold; height:40px;")
         btn_send.clicked.connect(self.send_message_action)
         
-        s_lay.addWidget(QLabel("Stream:"), 0, 0); s_lay.addWidget(self.in_stream, 0, 1)
-        s_lay.addWidget(QLabel("Function:"), 0, 2); s_lay.addWidget(self.in_func, 0, 3)
-        s_lay.addWidget(QLabel("Payload:"), 1, 0); s_lay.addWidget(self.in_payload, 1, 1, 1, 3)
-        s_lay.addWidget(btn_send, 2, 0, 1, 4)
+        s_lay.addLayout(header_h); s_lay.addWidget(self.in_payload); s_lay.addWidget(btn_send)
         send_group.setLayout(s_lay)
 
-        # Log View
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background:#000; color:#0f0; font-family:Consolas; font-size:10pt;")
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
+        self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:Consolas; font-size:10pt;")
         
-        right_panel.addWidget(send_group)
-        right_panel.addWidget(QLabel("### Communication Logs"))
-        right_panel.addWidget(self.log_view)
+        right_panel.addWidget(send_group); right_panel.addWidget(QLabel("### System & Protocol Logs")); right_panel.addWidget(self.log_view)
 
-        main_layout.addLayout(left_panel, 1)
-        main_layout.addLayout(right_panel, 2)
+        main_layout.addLayout(left_panel, 1); main_layout.addLayout(right_panel, 2)
         self.setCentralWidget(QWidget()); self.centralWidget().setLayout(main_layout)
 
     def _st_lbl(self, txt):
-        l = QLabel(txt); l.setAlignment(Qt.AlignmentFlag.AlignCenter); l.setMinimumHeight(45)
+        l = QLabel(txt); l.setAlignment(Qt.AlignmentFlag.AlignCenter); l.setMinimumHeight(40)
         l.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain)
-        l.setStyleSheet("background:#34495e; color:#7f8c8d; border:1px solid #2c3e50;")
+        l.setStyleSheet("background:#34495e; color:#7f8c8d;")
         return l
+
+    def apply_node(self):
+        name = self.in_name.text()
+        if not name: return
+        mode = "Active" if self.rb_act.isChecked() else "Passive"
+        params = {k: float(w.text()) for k, w in self.t_inputs.items()}
+        if name not in self.sessions:
+            inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode, params)
+            inst.status_changed.connect(self.update_state_ui)
+            inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {m}"))
+            self.sessions[name] = inst
+            self.combo_nodes.addItem(name)
+        else:
+            self.sessions[name].params = params
+        self.log_view.append(f"SYSTEM | Node '{name}' updated with new T-params.")
 
     def on_node_selected(self, idx):
         if idx > 0:
@@ -230,26 +247,13 @@ class HSMSMonitorApp(QMainWindow):
             self.current_node_name = name
             inst = self.sessions[name]
             self.in_name.setText(name); self.in_host.setText(inst.host); self.in_port.setText(str(inst.port))
-            self.rb_act.setChecked(inst.mode == "Active"); self.rb_pas.setChecked(inst.mode == "Passive")
+            for k, val in inst.params.items(): self.t_inputs[k].setText(str(val))
             self.update_state_ui(name, inst.current_state)
-
-    def apply_node(self):
-        name = self.in_name.text()
-        if not name: return
-        mode = "Active" if self.rb_act.isChecked() else "Passive"
-        if name not in self.sessions:
-            inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode)
-            inst.status_changed.connect(self.update_state_ui)
-            inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}"))
-            self.sessions[name] = inst
-            self.combo_nodes.addItem(name)
-        self.log_view.append(f"SYSTEM | Node '{name}' Configured.")
 
     def update_state_ui(self, name, status):
         if name in self.sessions: self.sessions[name].current_state = status
         if name != self.current_node_name: return
-        
-        off, on = "background:#34495e; color:#7f8c8d;", "background:#2ecc71; color:#000; font-weight:bold; border:2px solid white;"
+        off, on = "background:#34495e; color:#7f8c8d;", "background:#2ecc71; color:#000; font-weight:bold;"
         self.st_nc.setStyleSheet(off); self.st_ns.setStyleSheet(off); self.st_sl.setStyleSheet(off)
         if status == "SELECTED": self.st_sl.setStyleSheet(on)
         elif status == "NOT SELECTED": self.st_ns.setStyleSheet(on)
@@ -257,12 +261,15 @@ class HSMSMonitorApp(QMainWindow):
 
     def send_message_action(self):
         if not self.current_node_name: return
-        s = int(self.in_stream.text()); f = int(self.in_func.text())
+        s, f = int(self.in_s.text()), int(self.in_f.text())
         asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].send_data_message(s, f), self.loop)
 
     def start_comm(self):
         if self.current_node_name:
             asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].run_task(), self.loop)
+
+    def stop_comm(self):
+        if self.current_node_name: self.sessions[self.current_node_name].stop()
 
 class AsyncLoopThread(QThread):
     def __init__(self):
