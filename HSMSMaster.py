@@ -26,7 +26,7 @@ class HSMSHeader:
         return cls(stream=h[1], function=h[2], s_type=h[4], system_bytes=h[5])
 
 class SECSParser:
-    """SEMI E5 SECS-II Data Item Parser with Hex + ASCII View"""
+    """SEMI E5 SECS-II Data Item Parser with Structural View & Row Separation"""
     FORMAT_CODES = {
         0: "L", 8: "B", 9: "BOOL", 16: "A", 20: "I8", 21: "I1", 22: "I2", 24: "I4",
         28: "F8", 32: "U8", 33: "U1", 34: "U2", 36: "U4", 44: "F4"
@@ -34,12 +34,13 @@ class SECSParser:
 
     @staticmethod
     def to_readable_str(data):
-        """바이너리 데이터를 가독성 있는 문자열로 변환 (제어문자는 . 처리)"""
+        """제어 문자는 .으로 치환하여 ASCII 문자열 반환"""
         return "".join([chr(b) if 32 <= b <= 126 else "." for b in data])
 
     @classmethod
-    def parse(cls, data):
-        if not data: return "Empty", 0
+    def parse_recursive(cls, data, indent=0):
+        """구조체 형태를 유지하며 재귀적으로 파싱"""
+        if not data: return "", "", 0
         try:
             format_byte = data[0]
             fmt_code = (format_byte & 0xFC) >> 2
@@ -55,31 +56,37 @@ class SECSParser:
                 length = struct.unpack(">I", b'\x00' + data[ptr:ptr+3])[0]; ptr += 3
 
             fmt_name = cls.FORMAT_CODES.get(fmt_code, f"Unk({fmt_code})")
+            spacing = "  " * indent
             
             if fmt_name == "L":
-                items = []
+                hex_out = f"{spacing}{data[:ptr].hex(' ').upper()} (List Head)\n"
+                ascii_out = f"{spacing}<L[{length}]\n"
                 sub_data = data[ptr:]
                 offset = 0
                 for _ in range(length):
-                    item, consumed = cls.parse(sub_data[offset:])
-                    items.append(item)
+                    h, a, consumed = cls.parse_recursive(sub_data[offset:], indent + 1)
+                    hex_out += h
+                    ascii_out += a
                     offset += consumed
-                return f"L[{length}] {items}", ptr + offset
+                ascii_out += f"{spacing}>\n"
+                return hex_out, ascii_out, ptr + offset
             
+            # 일반 데이터 아이템
             val_data = data[ptr:ptr+length]
+            header_hex = data[:ptr].hex(' ').upper()
+            val_hex = val_data.hex(' ').upper()
+            val_ascii = cls.to_readable_str(val_data)
             
-            # 주석 기호(*) 처리 (ASCII 타입인 경우)
-            raw_hex = val_data.hex(' ').upper()
-            raw_ascii = cls.to_readable_str(val_data)
+            # 주석 기호(*) 필터링 (ASCII 타입 시)
+            if fmt_name == "A" and '*' in val_ascii:
+                val_ascii = val_ascii.split('*')[0].strip()
+
+            hex_line = f"{spacing}{header_hex} | {val_hex}\n"
+            ascii_line = f"{spacing}<{fmt_name} '{val_ascii}'>\n"
             
-            if fmt_name == "A":
-                if '*' in raw_ascii:
-                    raw_ascii = raw_ascii.split('*')[0].strip()
-            
-            return f"{fmt_name}: '{raw_hex} [{raw_ascii}]'", ptr + length
+            return hex_line, ascii_line, ptr + length
         except Exception:
-            # 파싱 실패 시 전체 데이터를 Hex [ASCII] 덤프로 출력
-            return f"DUMP: '{data.hex(' ').upper()} [{cls.to_readable_str(data)}]'", len(data)
+            return f"HEX DUMP: {data.hex(' ').upper()}\n", f"ASCII DUMP: {cls.to_readable_str(data)}\n", len(data)
 
 # --- [2. HSMS Instance & Protocol Logic] ---
 class HSMSInstance(QObject):
@@ -96,15 +103,19 @@ class HSMSInstance(QObject):
         self.current_state = "NOT CONNECTED"
 
     def handle_secs_message(self, header, payload):
-        body_str, _ = SECSParser.parse(payload)
-        msg = f"RECV | S{header.stream}F{header.function} | {body_str}"
+        """행 분리 및 구조체 유지 출력 핸들러"""
+        hex_struct, ascii_struct, _ = SECSParser.parse_recursive(payload)
+        
+        msg = f"● RECV [S{header.stream}F{header.function}] SystemBytes: {header.system_bytes:08X}\n"
+        msg += "--- HEX CODE VIEW ---\n" + hex_struct
+        msg += "--- STRUCTURE VIEW ---\n" + ascii_struct
+        msg += "--------------------------------------"
         self.log_signal.emit(msg)
 
     def send_control_message(self, header):
         if self.transport:
             msg = header.pack()
             self.transport.write(struct.pack(">I", len(msg)) + msg)
-            self.log_signal.emit(f"SEND | Control Type:{header.s_type}")
 
     async def send_data_message(self, s, f, payload_text=""):
         header = HSMSHeader(stream=s, function=f, s_type=0)
@@ -122,7 +133,7 @@ class HSMSInstance(QObject):
         if self.transport:
             full = header.pack() + payload
             self.transport.write(struct.pack(">I", len(full)) + full)
-            self.log_signal.emit(f"SEND | S{s}F{f} | Body: {final_payload_text}")
+            self.log_signal.emit(f"○ SEND [S{s}F{f}] Body: {final_payload_text}")
         else:
             self.log_signal.emit("ERROR | Not Connected")
 
@@ -196,8 +207,8 @@ class HSMSMonitorApp(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Master v2.5.3 - Hex/ASCII Viewer")
-        self.resize(1100, 850)
+        self.setWindowTitle("HSMS Master v2.5.4 - Structured Viewer")
+        self.resize(1100, 900)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
         
@@ -250,7 +261,8 @@ class HSMSMonitorApp(QMainWindow):
         log_group = QGroupBox("Communication Logs")
         l_lay = QVBoxLayout()
         self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:Consolas; font-size:10pt;")
+        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:Consolas; font-size:9pt;")
         l_lay.addWidget(self.log_view)
         log_group.setLayout(l_lay)
 
@@ -265,34 +277,27 @@ class HSMSMonitorApp(QMainWindow):
 
     def apply_node(self):
         try:
-            name = self.in_name.text()
+            name, mode = self.in_name.text(), ("Active" if self.rb_act.isChecked() else "Passive")
             if not name: return
-            mode = "Active" if self.rb_act.isChecked() else "Passive"
             params = {k: float(w.text()) for k, w in self.t_inputs.items()}
             if name not in self.sessions:
                 inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode, params)
-                inst.status_changed.connect(self.update_state_ui)
-                inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {m}"))
-                self.sessions[name] = inst
-                self.combo_nodes.addItem(name)
-            else: 
-                self.sessions[name].mode = mode
-                self.sessions[name].params = params
+                inst.status_changed.connect(self.update_state_ui); inst.log_signal.connect(self._safe_log)
+                self.sessions[name] = inst; self.combo_nodes.addItem(name)
+            else: self.sessions[name].mode, self.sessions[name].params = mode, params
             self.log_view.append(f"UI | Node '{name}' Configured.")
         except Exception as e: self.log_view.append(f"UI ERROR | {e}")
 
+    def _safe_log(self, m):
+        self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+
     def on_node_selected(self, idx):
         if idx <= 0: return
-        try:
-            name = self.combo_nodes.currentText()
-            self.current_node_name = name
-            inst = self.sessions[name]
-            self.in_name.setText(name); self.in_host.setText(inst.host); self.in_port.setText(str(inst.port))
-            self.rb_act.setChecked(inst.mode == "Active")
-            self.rb_pas.setChecked(inst.mode == "Passive")
-            for k, v in inst.params.items(): self.t_inputs[k].setText(str(v))
-            self.update_state_ui(name, inst.current_state)
-        except Exception as e: self.log_view.append(f"UI ERROR | {e}")
+        name = self.combo_nodes.currentText(); self.current_node_name = name; inst = self.sessions[name]
+        self.in_name.setText(name); self.in_host.setText(inst.host); self.in_port.setText(str(inst.port))
+        self.rb_act.setChecked(inst.mode == "Active"); self.rb_pas.setChecked(inst.mode == "Passive")
+        for k, v in inst.params.items(): self.t_inputs[k].setText(str(v))
+        self.update_state_ui(name, inst.current_state)
 
     def update_state_ui(self, name, status):
         if name in self.sessions: self.sessions[name].current_state = status
@@ -305,10 +310,8 @@ class HSMSMonitorApp(QMainWindow):
 
     def send_message_action(self):
         if self.current_node_name:
-            try:
-                s, f = int(self.in_s.text()), int(self.in_f.text())
-                asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].send_data_message(s, f, self.in_payload.toPlainText()), self.loop)
-            except Exception as e: self.log_view.append(f"UI ERROR | {e}")
+            s, f = int(self.in_s.text()), int(self.in_f.text())
+            asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].send_data_message(s, f, self.in_payload.toPlainText()), self.loop)
 
     def start_comm(self):
         if self.current_node_name: asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].run_task(), self.loop)
@@ -330,4 +333,5 @@ if __name__ == "__main__":
     while not t.loop: pass
     win = HSMSMonitorApp(t.loop); win.show()
     sys.exit(app.exec())
+
 
