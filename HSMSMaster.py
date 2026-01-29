@@ -26,7 +26,7 @@ class HSMSHeader:
         return cls(stream=h[1], function=h[2], s_type=h[4], system_bytes=h[5])
 
 class SECSParser:
-    """SEMI E5 SECS-II Data Item Parser (Recursive)"""
+    """SEMI E5 SECS-II Data Item Parser (Recursive) with Comment Support"""
     FORMAT_CODES = {
         0: "L", 8: "B", 9: "BOOL", 16: "A", 20: "I8", 21: "I1", 22: "I2", 24: "I4",
         28: "F8", 32: "U8", 33: "U1", 34: "U2", 36: "U4", 44: "F4"
@@ -34,6 +34,11 @@ class SECSParser:
 
     @classmethod
     def parse(cls, data):
+        """
+        데이터 바이트를 파싱합니다. 
+        만약 수신된 바이트 스트림 내부에 주석 기호(*)가 직접 포함되지는 않지만, 
+        텍스트 파싱 결과물에서 주석을 제거하는 필터링 로직을 포함합니다.
+        """
         if not data: return "Empty Payload", 0
         try:
             format_byte = data[0]
@@ -65,7 +70,13 @@ class SECSParser:
             # 일반 데이터 아이템 처리
             val_data = data[ptr:ptr+length]
             if fmt_name == "A":
-                value = val_data.decode('ascii', errors='replace').strip()
+                # ASCII 데이터 내부에 '*'가 있다면 주석으로 처리하여 무시
+                raw_value = val_data.decode('ascii', errors='replace').strip()
+                # '*' 문자가 발견되면 그 이후를 잘라냄
+                if '*' in raw_value:
+                    value = raw_value.split('*')[0].strip()
+                else:
+                    value = raw_value
             elif fmt_name in ["I1", "I2", "I4", "U1", "U2", "U4", "B"]:
                 value = val_data.hex(' ').upper()
             else:
@@ -94,10 +105,6 @@ class HSMSInstance(QObject):
         body_str, _ = SECSParser.parse(payload)
         msg = f"RECV | S{header.stream}F{header.function} | Body: {body_str}"
         self.log_signal.emit(msg)
-        
-        # [확장 포인트] 특정 메시지 수신 시 로직 분기 가능
-        # if header.stream == 1 and header.function == 1:
-        #     self.log_signal.emit("SYSTEM | S1F1 (Are You There) Detected")
 
     def send_control_message(self, header):
         if self.transport:
@@ -106,16 +113,29 @@ class HSMSInstance(QObject):
             self.log_signal.emit(f"SEND | Control Type:{header.s_type}")
 
     async def send_data_message(self, s, f, payload_text=""):
+        """
+        메시지 전송 시 사용자가 입력한 텍스트에서 
+        * 로 시작하는 행이나 문구 이후를 주석 처리하여 제외합니다.
+        """
         header = HSMSHeader(stream=s, function=f, s_type=0)
         self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
         header.system_bytes = self._sys_byte
         
-        # 단순 텍스트 전송 (SECS 구조는 추후 ItemBuilder 연동 권장)
-        payload = payload_text.encode('utf-8')
+        # 주석 제거 로직 반영
+        filtered_lines = []
+        for line in payload_text.splitlines():
+            # 각 행에서 * 문자가 나오면 그 이후는 무시
+            clean_line = line.split('*')[0].strip()
+            if clean_line:
+                filtered_lines.append(clean_line)
+        
+        final_payload_text = "\n".join(filtered_lines)
+        payload = final_payload_text.encode('utf-8')
+
         if self.transport:
             full = header.pack() + payload
             self.transport.write(struct.pack(">I", len(full)) + full)
-            self.log_signal.emit(f"SEND | S{s}F{f} | Body: {payload_text}")
+            self.log_signal.emit(f"SEND | S{s}F{f} | Body: {final_payload_text} (Comments ignored)")
         else:
             self.log_signal.emit("ERROR | Not Connected")
 
@@ -174,7 +194,7 @@ class HSMSProtocol(asyncio.Protocol):
             
             if header.s_type == 0:
                 self.instance.handle_secs_message(header, payload)
-            elif header.s_type == 1: # Select.req 처리
+            elif header.s_type == 1: 
                 self.instance.send_control_message(HSMSHeader(s_type=2, system_bytes=header.system_bytes))
                 self.instance.status_changed.emit(self.instance.name, "SELECTED")
             
@@ -194,12 +214,12 @@ class HSMSMonitorApp(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Master v2.5.0 - SECS-II Parser Integrated")
+        self.setWindowTitle("HSMS Master v2.5.1 - Comment Filtering Integrated")
         self.resize(1100, 850)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
         
-        # Left Panel: Config
+        # Left Panel: Config (생략된 기존 v2.5.0 코드와 동일)
         left_panel = QVBoxLayout()
         cfg_box = QGroupBox("Node Config")
         f_lay = QFormLayout()
@@ -242,6 +262,7 @@ class HSMSMonitorApp(QMainWindow):
         self.in_s, self.in_f = QLineEdit("1"), QLineEdit("1")
         h_lay.addWidget(QLabel("S:")); h_lay.addWidget(self.in_s); h_lay.addWidget(QLabel("F:")); h_lay.addWidget(self.in_f)
         self.in_payload = QTextEdit(); self.in_payload.setFixedHeight(120)
+        self.in_payload.setPlaceholderText("Enter payload here... (Lines starting with * are ignored)")
         btn_send = QPushButton("SEND MESSAGE"); btn_send.setStyleSheet("background:#27ae60; color:white; font-weight:bold; height:35px;")
         btn_send.clicked.connect(self.send_message_action)
         s_lay.addLayout(h_lay); s_lay.addWidget(self.in_payload); s_lay.addWidget(btn_send)
@@ -267,7 +288,7 @@ class HSMSMonitorApp(QMainWindow):
         try:
             name = self.in_name.text()
             if not name: return
-            mode = "Active" if self.rb_act.isChecked() else "Passive"
+            mode = \"Active\" if self.rb_act.isChecked() else \"Passive\"
             params = {k: float(w.text()) for k, w in self.t_inputs.items()}
             if name not in self.sessions:
                 inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode, params)
@@ -293,10 +314,10 @@ class HSMSMonitorApp(QMainWindow):
     def update_state_ui(self, name, status):
         if name in self.sessions: self.sessions[name].current_state = status
         if name != self.current_node_name: return
-        off, on = "background:#34495e; color:#7f8c8d;", "background:#2ecc71; color:#000; font-weight:bold;"
+        off, on = \"background:#34495e; color:#7f8c8d;\", \"background:#2ecc71; color:#000; font-weight:bold;\"
         self.st_nc.setStyleSheet(off); self.st_ns.setStyleSheet(off); self.st_sl.setStyleSheet(off)
-        if status == "SELECTED": self.st_sl.setStyleSheet(on)
-        elif status == "NOT SELECTED": self.st_ns.setStyleSheet(on)
+        if status == \"SELECTED\": self.st_sl.setStyleSheet(on)
+        elif status == \"NOT SELECTED\": self.st_ns.setStyleSheet(on)
         else: self.st_nc.setStyleSheet(on)
 
     def send_message_action(self):
