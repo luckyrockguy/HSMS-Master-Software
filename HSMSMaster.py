@@ -1,18 +1,19 @@
 import sys
 import asyncio
 import struct
-import traceback
+import re
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLabel, QLineEdit, QGroupBox, QFormLayout, 
                              QPushButton, QComboBox, QRadioButton, QGridLayout, QFrame, 
-                             QSizePolicy)
+                             QSizePolicy, QSplitter)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt
 
 # --- [1. HSMS Header & SECS-II Parser] ---
 class HSMSHeader:
-    def __init__(self, stream=0, function=0, s_type=0, system_bytes=0):
-        self.stream = stream
+    def __init__(self, stream=0, function=0, s_type=0, system_bytes=0, wait_bit=False):
+        # Wait Bit가 True이면 Stream 번호에 0x80(MSB 1)을 설정
+        self.stream = (stream | 0x80) if wait_bit else stream
         self.function = function
         self.s_type = s_type 
         self.system_bytes = system_bytes
@@ -26,69 +27,44 @@ class HSMSHeader:
         return cls(stream=h[1], function=h[2], s_type=h[4], system_bytes=h[5])
 
 class SECSParser:
-    """SEMI E5 SECS-II Data Item Parser with Structural View & Row Separation"""
-    FORMAT_CODES = {
-        0: "L", 8: "B", 9: "BOOL", 16: "A", 20: "I8", 21: "I1", 22: "I2", 24: "I4",
-        28: "F8", 32: "U8", 33: "U1", 34: "U2", 36: "U4", 44: "F4"
-    }
+    FORMAT_CODES = {0: "L", 8: "B", 16: "A", 20: "I8", 21: "I1", 22: "I2", 24: "I4", 32: "U8", 33: "U1", 34: "U2", 36: "U4"}
 
     @staticmethod
-    def to_readable_str(data):
-        """제어 문자는 .으로 치환하여 ASCII 문자열 반환"""
-        return "".join([chr(b) if 32 <= b <= 126 else "." for b in data])
+    def wrap_hex(data, width=16):
+        if not data: return ""
+        hex_str = data.hex(' ').upper()
+        parts = hex_str.split(' ')
+        return "\n".join([" ".join(parts[i:i+width]) for i in range(0, len(parts), width)])
 
     @classmethod
     def parse_recursive(cls, data, indent=0):
-        """구조체 형태를 유지하며 재귀적으로 파싱"""
-        if not data: return "", "", 0
+        if not data: return "", 0
         try:
             format_byte = data[0]
             fmt_code = (format_byte & 0xFC) >> 2
             len_bytes_cnt = format_byte & 0x03
-            
             ptr = 1
             length = 0
-            if len_bytes_cnt == 1:
-                length = data[ptr]; ptr += 1
-            elif len_bytes_cnt == 2:
-                length = struct.unpack(">H", data[ptr:ptr+2])[0]; ptr += 2
-            elif len_bytes_cnt == 3:
-                length = struct.unpack(">I", b'\x00' + data[ptr:ptr+3])[0]; ptr += 3
+            if len_bytes_cnt == 1: length = data[ptr]; ptr += 1
+            elif len_bytes_cnt == 2: length = struct.unpack(">H", data[ptr:ptr+2])[0]; ptr += 2
+            elif len_bytes_cnt == 3: length = struct.unpack(">I", b'\x00' + data[ptr:ptr+3])[0]; ptr += 3
 
             fmt_name = cls.FORMAT_CODES.get(fmt_code, f"Unk({fmt_code})")
             spacing = "  " * indent
-            
             if fmt_name == "L":
-                hex_out = f"{spacing}{data[:ptr].hex(' ').upper()} (List Head)\n"
-                ascii_out = f"{spacing}<L[{length}]\n"
-                sub_data = data[ptr:]
-                offset = 0
+                out = f"{spacing}<L[{length}]\n"
+                sub_data, offset = data[ptr:], 0
                 for _ in range(length):
-                    h, a, consumed = cls.parse_recursive(sub_data[offset:], indent + 1)
-                    hex_out += h
-                    ascii_out += a
-                    offset += consumed
-                ascii_out += f"{spacing}>\n"
-                return hex_out, ascii_out, ptr + offset
+                    a, consumed = cls.parse_recursive(sub_data[offset:], indent + 1)
+                    out += a; offset += consumed
+                return out + f"{spacing}>\n", ptr + offset
             
-            # 일반 데이터 아이템
             val_data = data[ptr:ptr+length]
-            header_hex = data[:ptr].hex(' ').upper()
-            val_hex = val_data.hex(' ').upper()
-            val_ascii = cls.to_readable_str(val_data)
-            
-            # 주석 기호(*) 필터링 (ASCII 타입 시)
-            if fmt_name == "A" and '*' in val_ascii:
-                val_ascii = val_ascii.split('*')[0].strip()
+            val_ascii = "".join([chr(b) if 32 <= b <= 126 else "." for b in val_data])
+            return f"{spacing}<{fmt_name} '{val_ascii}'>\n", ptr + length
+        except: return f"{spacing}[Parse Error]\n", len(data)
 
-            hex_line = f"{spacing}{header_hex} | {val_hex}\n"
-            ascii_line = f"{spacing}<{fmt_name} '{val_ascii}'>\n"
-            
-            return hex_line, ascii_line, ptr + length
-        except Exception:
-            return f"HEX DUMP: {data.hex(' ').upper()}\n", f"ASCII DUMP: {cls.to_readable_str(data)}\n", len(data)
-
-# --- [2. HSMS Instance & Protocol Logic] ---
+# --- [2. HSMS Instance & Logic] ---
 class HSMSInstance(QObject):
     status_changed = pyqtSignal(str, str)
     log_signal = pyqtSignal(str)
@@ -96,46 +72,158 @@ class HSMSInstance(QObject):
     def __init__(self, name, host, port, mode="Active", params=None):
         super().__init__()
         self.name, self.host, self.port, self.mode = name, host, port, mode
-        self.params = params or {'T3': 45.0, 'T5': 10.0, 'T6': 5.0, 'T7': 10.0, 'T8': 5.0}
-        self.transport, self.server = None, None
-        self.running, self._sys_byte = False, 0
-        self._pending_tx = {}
+        self.params = params or {'T3': 45.0, 'T5': 10.0, 'T6': 5.0}
+        self.transport, self.server, self.running, self._sys_byte = None, None, False, 0
         self.current_state = "NOT CONNECTED"
 
-    def handle_secs_message(self, header, payload):
-        """행 분리 및 구조체 유지 출력 핸들러"""
-        hex_struct, ascii_struct, _ = SECSParser.parse_recursive(payload)
+    def log_full_message(self, direction, header, payload):
+        s_val = header.stream & 0x7F
+        w_bit = " (Wait)" if header.stream & 0x80 else ""
+        hex_view = SECSParser.wrap_hex(payload)
+        ascii_struct, _ = SECSParser.parse_recursive(payload)
         
-        msg = f"● RECV [S{header.stream}F{header.function}] SystemBytes: {header.system_bytes:08X}\n"
-        msg += "--- HEX CODE VIEW ---\n" + hex_struct
-        msg += "--- STRUCTURE VIEW ---\n" + ascii_struct
-        msg += "--------------------------------------"
+        icon = "○ SEND" if direction == "SEND" else "● RECV"
+        msg = f"{icon} [S{s_val}F{header.function}{w_bit}] SysByte: {header.system_bytes:08X}\n"
+        if hex_view:
+            msg += f"--- HEX RAW VIEW ---\n{hex_view}\n\n"
+        msg += f"--- STRUCTURE VIEW ---\n{ascii_struct}--------------------------------------"
         self.log_signal.emit(msg)
 
-    def send_control_message(self, header):
-        if self.transport:
-            msg = header.pack()
-            self.transport.write(struct.pack(">I", len(msg)) + msg)
+    async def send_data_message(self, payload_text):
+        self.log_signal.emit("DEBUG | [Parsing Start] Analyzing input message...")
+        
+        # 연결 상태 확인
+        if not self.transport or self.transport.is_closing():
+            self.log_signal.emit("DEBUG | [ERROR] 연결된 노드가 없습니다. 전송을 중단합니다.")
+            return
+            
+        s, f, w = 0, 0, False
+        
+        lines = payload_text.splitlines()
+        if not lines:
+            self.log_signal.emit("DEBUG | [ERROR] 입력된 메시지가 없습니다.")
+            return        
+        
+        # 헤더 및 Wait Bit 파싱 (첫 줄 대상)
+        first_line = lines[0]
+        # 주석 제거 (첫 줄에서도 * 뒤는 무시)
+        first_line_clean = first_line.split('*')[0]
+        
+        # 첫 번째 따옴표 안의 문자열 추출 (예: 'S14F1')
+        match = re.search(r"'([Ss]\d+[Ff]\d+)'", first_line_clean)
+        if match:
+            header_str = match.group(1).upper()
+            self.log_signal.emit(f"DEBUG | [Step 1] Found header string in quotes: '{header_str}'")
+            
+            # 2. S와 F 번호 추출
+            s_match = re.search(r"S(\d+)", header_str)
+            f_match = re.search(r"F(\d+)", header_str)   
+            
+            if s_match and f_match:
+                s = int(s_match.group(1))
+                f = int(f_match.group(1))
+                self.log_signal.emit(f"DEBUG | [Step 2] Parsed Stream={s}, Function={f}")
+                
+                # Stream/Function 문자열('SxFy') 뒤에서만 W 찾기
+                # match.end() 이후의 문자열에서 'W' 검색
+                post_header_text = first_line_clean[match.end():].upper()
+                if 'W' in post_header_text:
+                    w = True
 
-    async def send_data_message(self, s, f, payload_text=""):
-        header = HSMSHeader(stream=s, function=f, s_type=0)
+                self.log_signal.emit(f"DEBUG | [STEP 2] 헤더 파싱 완료: S{s}F{f}, Wait={w}")
+            else:
+                self.log_signal.emit("DEBUG | [ERROR] Could not find S or F numbers inside the quotes.")
+                return
+        else:
+            self.log_signal.emit("DEBUG | [Error] No quoted header (e.g., 'SxFy') found in input.")
+            return # 파싱 실패 시 전송 중단
+            
+        # 토큰화 (모든 데이터 타입 추출)
+        # <TYPE [LEN]> 또는 <TYPE 값> 형태 지원
+        tokens = []
+        for line in lines[1:]:
+            clean_line = line.split('*')[0].strip()
+            if not clean_line: continue
+            # 태그, 문자열, 숫자, 닫기 기호를 분리
+            line_tokens = re.findall(r"<[a-zA-Z0-9]+|'.*?'|[+-]?\d+\.?\d*|>", clean_line)
+            tokens.extend(line_tokens)
+
+        # SECS-II 표준 포맷 코드 (상위 6비트 값)
+        # 수치형 데이터가 Unk로 나오지 않도록 정확한 포맷 정의
+        FORMATS = {
+            "<L": 0x00, "<B": 0x08, "<BOOLEAN": 0x09, "<A": 0x10,
+            "<I8": 0x14, "<I1": 0x15, "<I2": 0x16, "<I4": 0x17,
+            "<F8": 0x20, "<F4": 0x24,
+            "<U8": 0x30, "<U1": 0x31, "<U2": 0x32, "<U4": 0x34
+        }
+
+        def pack_item(token_list):
+            if not token_list: return b""
+            tag = token_list.pop(0).upper()
+                
+            # 리스트 처리 (Recursive)
+            if tag == "<L":
+                children = []
+                while token_list and token_list[0] != ">":
+                    children.append(pack_item(token_list))
+                if token_list: token_list.pop(0) # pop '>'
+                 
+                # 포맷(0x00) | 길이바이트수(1) = 0x01
+                header = bytearray([0x01, len(children)])
+                for c in children: header.extend(c)
+                return header
+
+            fmt_code = FORMATS.get(tag)
+            if fmt_code is None: return b""
+
+            val_str = token_list.pop(0).strip("'")
+            if token_list and token_list[0] == ">": token_list.pop(0)
+
+            # 타입별 데이터 패킹 (Big-Endian)
+            if tag == "<A": data = val_str.encode('ascii')
+            elif tag == "<B": data = bytes.fromhex(val_str.replace(" ", ""))
+            elif tag in ["<U1","<U2","<U4","<U8"]:
+                fmt = {"<U1":"B", "<U2":"H", "<U4":"I", "<U8":"Q"}[tag]
+                data = struct.pack(">" + fmt, int(float(val_str)))
+            elif tag in ["<I1","<I2","<I4","<I8"]:
+                fmt = {"<I1":"b", "<I2":"h", "<I4":"i", "<I8":"q"}[tag]
+                data = struct.pack(">" + fmt, int(float(val_str)))
+            elif tag == "<F4": data = struct.pack(">f", float(val_str))
+            elif tag == "<F8": data = struct.pack(">d", float(val_str))
+            elif tag == "<BOOLEAN":
+                data = b'\xff' if val_str.upper() in ["TRUE", "1", "T"] else b'\x00'
+            else: data = b""
+
+            # 아이템 헤더: (Format << 2) | 0x01 (Length Byte Count 1)
+            header_byte = (fmt_code << 2) | 0x01
+            return bytearray([header_byte, len(data)]) + data
+
+        # 전체 바이너리 구성
+        body_bytes = bytearray()
+        while tokens:
+            body_bytes.extend(pack_item(tokens))
+        
+        # HSMS 패킷 결합 및 소켓 전송
+        header = HSMSHeader(stream=s, function=f, s_type=0, wait_bit=w)
         self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
         header.system_bytes = self._sys_byte
         
-        filtered_lines = []
-        for line in payload_text.splitlines():
-            clean_line = line.split('*')[0].strip()
-            if clean_line: filtered_lines.append(clean_line)
+        full_packet = header.pack() + body_bytes
+        msg_len = len(full_packet)
         
-        final_payload_text = "\n".join(filtered_lines)
-        payload = final_payload_text.encode('utf-8')
-
-        if self.transport:
-            full = header.pack() + payload
-            self.transport.write(struct.pack(">I", len(full)) + full)
-            self.log_signal.emit(f"○ SEND [S{s}F{f}] Body: {final_payload_text}")
-        else:
-            self.log_signal.emit("ERROR | Not Connected")
+        try:
+            # 4바이트 길이 헤더 + 10바이트 HSMS 헤더 + 본문
+            self.transport.write(struct.pack(">I", msg_len) + full_packet)
+            self.log_full_message("SEND", header, body_bytes)
+            self.log_signal.emit(f"DEBUG | [STEP 5] 소켓 전송 성공 (Total {msg_len + 4} bytes)")
+        except Exception as e:
+            self.log_signal.emit(f"DEBUG | [FATAL] 전송 중 오류 발생: {str(e)}")
+            
+    def set_state(self, new_state):
+        if self.current_state != new_state:
+            self.log_signal.emit(f"NODE STATUS | '{self.name}' state: {self.current_state} -> {new_state}")
+            self.current_state = new_state
+            self.status_changed.emit(self.name, new_state)
 
     async def run_task(self):
         self.running = True
@@ -143,30 +231,21 @@ class HSMSInstance(QObject):
             try:
                 loop = asyncio.get_running_loop()
                 if self.mode == "Active":
-                    self.transport, _ = await asyncio.wait_for(
-                        loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), timeout=self.params['T5'])
-                    resp, _ = await self._send_with_wait(HSMSHeader(s_type=1), timeout=self.params['T6'])
-                    if resp.s_type == 2:
-                        self.status_changed.emit(self.name, "SELECTED")
-                        while self.running and self.transport and not self.transport.is_closing(): await asyncio.sleep(0.5)
-                else: 
+                    self.log_signal.emit(f"NODE | Active: Connecting to {self.host}:{self.port}...")
+                    self.transport, _ = await asyncio.wait_for(loop.create_connection(lambda: HSMSProtocol(self), self.host, self.port), timeout=5.0)
+                    self.set_state("CONNECTED")
+                    self.log_signal.emit("HANDSHAKE | SEND Select.req (S-Type 1)")
+                    select_req = HSMSHeader(s_type=1, system_bytes=0x1234).pack()
+                    self.transport.write(struct.pack(">I", len(select_req)) + select_req)
+                    while self.running and self.transport and not self.transport.is_closing(): await asyncio.sleep(0.5)
+                else:
+                    self.log_signal.emit(f"NODE | Passive: Server listening on {self.port}...")
                     self.server = await loop.create_server(lambda: HSMSProtocol(self), '0.0.0.0', self.port)
                     async with self.server: await self.server.serve_forever()
-            except Exception:
-                if self.running:
-                    self.status_changed.emit(self.name, "NOT CONNECTED")
-                    await asyncio.sleep(self.params['T5'])
-
-    async def _send_with_wait(self, header, timeout=10.0):
-        self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
-        header.system_bytes = self._sys_byte
-        f = asyncio.get_running_loop().create_future()
-        self._pending_tx[self._sys_byte] = f
-        msg = header.pack()
-        if self.transport:
-            self.transport.write(struct.pack(">I", len(msg)) + msg)
-            return await asyncio.wait_for(f, timeout)
-        raise Exception("Lost Transport")
+            except Exception as e:
+                self.set_state("NOT CONNECTED")
+                self.log_signal.emit(f"NODE | Error: {e}")
+                await asyncio.sleep(5.0)
 
     def stop(self):
         self.running = False
@@ -174,8 +253,13 @@ class HSMSInstance(QObject):
         if self.server: self.server.close()
 
 class HSMSProtocol(asyncio.Protocol):
-    def __init__(self, instance):
-        self.instance, self.buf = instance, bytearray()
+    def __init__(self, instance): self.instance, self.buf = instance, bytearray()
+    
+    def connection_made(self, transport):
+        self.instance.transport = transport
+        peer = transport.get_extra_info('peername')
+        self.instance.log_signal.emit(f"HANDSHAKE | Connection established with {peer}")
+        if self.instance.mode == "Passive": self.instance.set_state("CONNECTED")
 
     def data_received(self, data):
         self.buf.extend(data)
@@ -185,33 +269,37 @@ class HSMSProtocol(asyncio.Protocol):
             raw = self.buf[4:4+length]
             self.buf = self.buf[4+length:]
             header = HSMSHeader.unpack(raw[:10])
-            payload = raw[10:]
-            if header.s_type == 0:
-                self.instance.handle_secs_message(header, payload)
-            elif header.s_type == 1: 
-                self.instance.send_control_message(HSMSHeader(s_type=2, system_bytes=header.system_bytes))
-                self.instance.status_changed.emit(self.instance.name, "SELECTED")
-            if header.system_bytes in self.instance._pending_tx:
-                self.instance._pending_tx.pop(header.system_bytes).set_result((header, payload))
-
-    def connection_made(self, transport): self.instance.transport = transport
-    def connection_lost(self, exc): self.instance.transport = None; self.instance.status_changed.emit(self.instance.name, "NOT CONNECTED")
+            
+            if header.s_type == 1: # Select.req
+                self.instance.log_signal.emit(f"HANDSHAKE | RECV Select.req (SysByte: {header.system_bytes:08X})")
+                self.instance.log_signal.emit("HANDSHAKE | SEND Select.rsp (Success)")
+                resp = HSMSHeader(s_type=2, system_bytes=header.system_bytes).pack()
+                if self.instance.transport: self.instance.transport.write(struct.pack(">I", len(resp)) + resp)
+                self.instance.set_state("SELECTED")
+            elif header.s_type == 2: # Select.rsp
+                self.instance.log_signal.emit(f"HANDSHAKE | RECV Select.rsp (SysByte: {header.system_bytes:08X})")
+                self.instance.set_state("SELECTED")
+            elif header.s_type == 0: # Data Message
+                self.instance.log_full_message("RECV", header, raw[10:])
+                
+    def connection_lost(self, exc):
+        self.instance.log_signal.emit("HANDSHAKE | Connection lost.")
+        self.instance.set_state("NOT CONNECTED")
 
 # --- [3. Main UI Application] ---
 class HSMSMonitorApp(QMainWindow):
     def __init__(self, loop):
         super().__init__()
-        self.sessions = {}
-        self.loop = loop
-        self.current_node_name = None
+        self.sessions, self.loop, self.current_node_name = {}, loop, None
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Master v2.5.4 - Structured Viewer")
+        self.setWindowTitle("HSMS Master v2.5.12 - Fixed Message Transmission")
         self.resize(1100, 900)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
         
+        # --- 왼쪽 패널 (기존 디자인 철저 유지) ---
         left_panel = QVBoxLayout()
         cfg_box = QGroupBox("Node Config")
         f_lay = QFormLayout()
@@ -226,14 +314,6 @@ class HSMSMonitorApp(QMainWindow):
         f_lay.addRow("Mode:", mode_h); f_lay.addRow("IP/Port:", self.in_host); f_lay.addRow("", self.in_port)
         cfg_box.setLayout(f_lay)
 
-        t_box = QGroupBox("T-Parameters")
-        t_lay = QGridLayout()
-        self.t_inputs = {k: QLineEdit(str(v)) for k, v in {'T3':45, 'T5':10, 'T6':5, 'T7':10, 'T8':5}.items()}
-        for i, (k, w) in enumerate(self.t_inputs.items()):
-            t_lay.addWidget(QLabel(f"{k}:"), i//2, (i%2)*2)
-            t_lay.addWidget(w, i//2, (i%2)*2+1)
-        t_box.setLayout(t_lay)
-
         btn_apply = QPushButton("Apply Config"); btn_apply.clicked.connect(self.apply_node)
         btn_start = QPushButton("START"); btn_start.setStyleSheet("background:#2980b9; color:white; font-weight:bold;")
         btn_start.clicked.connect(self.start_comm)
@@ -241,77 +321,69 @@ class HSMSMonitorApp(QMainWindow):
         btn_stop.clicked.connect(self.stop_comm)
 
         self.st_nc, self.st_ns, self.st_sl = self._st_lbl("NOT CONNECTED"), self._st_lbl("NOT SELECTED"), self._st_lbl("SELECTED")
-        left_panel.addWidget(cfg_box); left_panel.addWidget(t_box); left_panel.addWidget(btn_apply)
-        left_panel.addWidget(btn_start); left_panel.addWidget(btn_stop); left_panel.addWidget(self.st_nc)
-        left_panel.addWidget(self.st_ns); left_panel.addWidget(self.st_sl); left_panel.addStretch()
 
+        left_panel.addWidget(cfg_box); left_panel.addWidget(btn_apply)
+        left_panel.addWidget(btn_start); left_panel.addWidget(btn_stop)
+        left_panel.addWidget(self.st_nc); left_panel.addWidget(self.st_ns); left_panel.addWidget(self.st_sl)
+        left_panel.addStretch()
+
+        # --- 오른쪽 패널 ---
         right_panel = QVBoxLayout()
-        send_group = QGroupBox("Message Transmission")
-        send_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed) 
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        send_group = QGroupBox("Message Transmission (Auto Header Detect)")
         s_lay = QVBoxLayout()
-        h_lay = QHBoxLayout()
-        self.in_s, self.in_f = QLineEdit("1"), QLineEdit("1")
-        h_lay.addWidget(QLabel("S:")); h_lay.addWidget(self.in_s); h_lay.addWidget(QLabel("F:")); h_lay.addWidget(self.in_f)
-        self.in_payload = QTextEdit(); self.in_payload.setFixedHeight(120)
+        self.in_payload = QTextEdit()
+        self.in_payload.setPlaceholderText("예: GetPJObj : 'S14F1' W\n<L [0]>")
         btn_send = QPushButton("SEND MESSAGE"); btn_send.setStyleSheet("background:#27ae60; color:white; font-weight:bold; height:35px;")
         btn_send.clicked.connect(self.send_message_action)
-        s_lay.addLayout(h_lay); s_lay.addWidget(self.in_payload); s_lay.addWidget(btn_send)
+        s_lay.addWidget(self.in_payload); s_lay.addWidget(btn_send)
         send_group.setLayout(s_lay)
 
         log_group = QGroupBox("Communication Logs")
         l_lay = QVBoxLayout()
-        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
-        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True); self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:Consolas; font-size:9pt;")
-        l_lay.addWidget(self.log_view)
-        log_group.setLayout(l_lay)
+        l_lay.addWidget(self.log_view); log_group.setLayout(l_lay)
 
-        right_panel.addWidget(send_group); right_panel.addWidget(log_group, stretch=1) 
+        splitter.addWidget(send_group); splitter.addWidget(log_group)
+        splitter.setStretchFactor(1, 4)
+        right_panel.addWidget(splitter)
+
         main_layout.addLayout(left_panel, 1); main_layout.addLayout(right_panel, 3)
         self.setCentralWidget(main_widget)
 
     def _st_lbl(self, txt):
         l = QLabel(txt); l.setAlignment(Qt.AlignmentFlag.AlignCenter); l.setMinimumHeight(40)
-        l.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain); l.setStyleSheet("background:#34495e; color:#7f8c8d;")
+        l.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain)
+        l.setStyleSheet("background:#34495e; color:#7f8c8d;")
         return l
 
     def apply_node(self):
-        try:
-            name, mode = self.in_name.text(), ("Active" if self.rb_act.isChecked() else "Passive")
-            if not name: return
-            params = {k: float(w.text()) for k, w in self.t_inputs.items()}
-            if name not in self.sessions:
-                inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode, params)
-                inst.status_changed.connect(self.update_state_ui); inst.log_signal.connect(self._safe_log)
-                self.sessions[name] = inst; self.combo_nodes.addItem(name)
-            else: self.sessions[name].mode, self.sessions[name].params = mode, params
-            self.log_view.append(f"UI | Node '{name}' Configured.")
-        except Exception as e: self.log_view.append(f"UI ERROR | {e}")
-
-    def _safe_log(self, m):
-        self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
-
-    def on_node_selected(self, idx):
-        if idx <= 0: return
-        name = self.combo_nodes.currentText(); self.current_node_name = name; inst = self.sessions[name]
-        self.in_name.setText(name); self.in_host.setText(inst.host); self.in_port.setText(str(inst.port))
-        self.rb_act.setChecked(inst.mode == "Active"); self.rb_pas.setChecked(inst.mode == "Passive")
-        for k, v in inst.params.items(): self.t_inputs[k].setText(str(v))
-        self.update_state_ui(name, inst.current_state)
+        name = self.in_name.text()
+        if not name: return
+        inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), "Active" if self.rb_act.isChecked() else "Passive")
+        inst.status_changed.connect(self.update_state_ui)
+        inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}"))
+        self.sessions[name] = inst; self.combo_nodes.addItem(name)
+        self.log_view.append(f"UI | Node '{name}' Configured.")
 
     def update_state_ui(self, name, status):
-        if name in self.sessions: self.sessions[name].current_state = status
         if name != self.current_node_name: return
         off, on = "background:#34495e; color:#7f8c8d;", "background:#2ecc71; color:#000; font-weight:bold;"
         self.st_nc.setStyleSheet(off); self.st_ns.setStyleSheet(off); self.st_sl.setStyleSheet(off)
         if status == "SELECTED": self.st_sl.setStyleSheet(on)
-        elif status == "NOT SELECTED": self.st_ns.setStyleSheet(on)
+        elif status == "CONNECTED": self.st_ns.setStyleSheet(on)
         else: self.st_nc.setStyleSheet(on)
+
+    def on_node_selected(self, idx):
+        if idx <= 0: return
+        self.current_node_name = self.combo_nodes.currentText()
+        self.update_state_ui(self.current_node_name, self.sessions[self.current_node_name].current_state)
 
     def send_message_action(self):
         if self.current_node_name:
-            s, f = int(self.in_s.text()), int(self.in_f.text())
-            asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].send_data_message(s, f, self.in_payload.toPlainText()), self.loop)
+            asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].send_data_message(self.in_payload.toPlainText()), self.loop)
 
     def start_comm(self):
         if self.current_node_name: asyncio.run_coroutine_threadsafe(self.sessions[self.current_node_name].run_task(), self.loop)
@@ -333,4 +405,3 @@ if __name__ == "__main__":
     while not t.loop: pass
     win = HSMSMonitorApp(t.loop); win.show()
     sys.exit(app.exec())
-
