@@ -26,15 +26,20 @@ class HSMSHeader:
         return cls(stream=h[1], function=h[2], s_type=h[4], system_bytes=h[5])
 
 class SECSParser:
-    """SEMI E5 SECS-II Data Item Parser (Recursive) with Comment Support"""
+    """SEMI E5 SECS-II Data Item Parser with Hex + ASCII View"""
     FORMAT_CODES = {
         0: "L", 8: "B", 9: "BOOL", 16: "A", 20: "I8", 21: "I1", 22: "I2", 24: "I4",
         28: "F8", 32: "U8", 33: "U1", 34: "U2", 36: "U4", 44: "F4"
     }
 
+    @staticmethod
+    def to_readable_str(data):
+        """바이너리 데이터를 가독성 있는 문자열로 변환 (제어문자는 . 처리)"""
+        return "".join([chr(b) if 32 <= b <= 126 else "." for b in data])
+
     @classmethod
     def parse(cls, data):
-        if not data: return "Empty Payload", 0
+        if not data: return "Empty", 0
         try:
             format_byte = data[0]
             fmt_code = (format_byte & 0xFC) >> 2
@@ -62,17 +67,19 @@ class SECSParser:
                 return f"L[{length}] {items}", ptr + offset
             
             val_data = data[ptr:ptr+length]
+            
+            # 주석 기호(*) 처리 (ASCII 타입인 경우)
+            raw_hex = val_data.hex(' ').upper()
+            raw_ascii = cls.to_readable_str(val_data)
+            
             if fmt_name == "A":
-                raw_value = val_data.decode('ascii', errors='replace').strip()
-                value = raw_value.split('*')[0].strip() if '*' in raw_value else raw_value
-            elif fmt_name in ["I1", "I2", "I4", "U1", "U2", "U4", "B"]:
-                value = val_data.hex(' ').upper()
-            else:
-                value = val_data.hex(' ').upper()
-
-            return f"{fmt_name}: '{value}'", ptr + length
-        except Exception as e:
-            return f"ParseError({e})", len(data)
+                if '*' in raw_ascii:
+                    raw_ascii = raw_ascii.split('*')[0].strip()
+            
+            return f"{fmt_name}: '{raw_hex} [{raw_ascii}]'", ptr + length
+        except Exception:
+            # 파싱 실패 시 전체 데이터를 Hex [ASCII] 덤프로 출력
+            return f"DUMP: '{data.hex(' ').upper()} [{cls.to_readable_str(data)}]'", len(data)
 
 # --- [2. HSMS Instance & Protocol Logic] ---
 class HSMSInstance(QObject):
@@ -90,7 +97,7 @@ class HSMSInstance(QObject):
 
     def handle_secs_message(self, header, payload):
         body_str, _ = SECSParser.parse(payload)
-        msg = f"RECV | S{header.stream}F{header.function} | Body: {body_str}"
+        msg = f"RECV | S{header.stream}F{header.function} | {body_str}"
         self.log_signal.emit(msg)
 
     def send_control_message(self, header):
@@ -189,7 +196,7 @@ class HSMSMonitorApp(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Master v2.5.2")
+        self.setWindowTitle("HSMS Master v2.5.3 - Hex/ASCII Viewer")
         self.resize(1100, 850)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
@@ -268,7 +275,9 @@ class HSMSMonitorApp(QMainWindow):
                 inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {m}"))
                 self.sessions[name] = inst
                 self.combo_nodes.addItem(name)
-            else: self.sessions[name].params = params
+            else: 
+                self.sessions[name].mode = mode
+                self.sessions[name].params = params
             self.log_view.append(f"UI | Node '{name}' Configured.")
         except Exception as e: self.log_view.append(f"UI ERROR | {e}")
 
@@ -321,3 +330,4 @@ if __name__ == "__main__":
     while not t.loop: pass
     win = HSMSMonitorApp(t.loop); win.show()
     sys.exit(app.exec())
+
