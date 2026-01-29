@@ -1,6 +1,7 @@
 import sys
 import asyncio
 import struct
+import traceback
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLabel, QLineEdit, QGroupBox, QFormLayout, 
@@ -36,18 +37,10 @@ class SECSParser:
         """제어 문자는 .으로 치환하여 ASCII 문자열 반환"""
         return "".join([chr(b) if 32 <= b <= 126 else "." for b in data])
 
-    @staticmethod
-    def wrap_hex(data, width=16):
-        """헥사 코드를 로그창 폭에 맞춰 줄바꿈 처리"""
-        hex_str = data.hex(' ').upper()
-        parts = hex_str.split(' ')
-        lines = [" ".join(parts[i:i+width]) for i in range(0, len(parts), width)]
-        return "\n".join(lines)
-
     @classmethod
     def parse_recursive(cls, data, indent=0):
-        """구조체(Cascade) 형태를 유지하며 재귀적으로 파싱"""
-        if not data: return "", 0
+        """구조체 형태를 유지하며 재귀적으로 파싱"""
+        if not data: return "", "", 0
         try:
             format_byte = data[0]
             fmt_code = (format_byte & 0xFC) >> 2
@@ -66,27 +59,34 @@ class SECSParser:
             spacing = "  " * indent
             
             if fmt_name == "L":
-                out = f"{spacing}<L [{length}]\n"
+                hex_out = f"{spacing}{data[:ptr].hex(' ').upper()} (List Head)\n"
+                ascii_out = f"{spacing}<L[{length}]\n"
                 sub_data = data[ptr:]
                 offset = 0
                 for _ in range(length):
-                    txt, consumed = cls.parse_recursive(sub_data[offset:], indent + 1)
-                    out += txt
+                    h, a, consumed = cls.parse_recursive(sub_data[offset:], indent + 1)
+                    hex_out += h
+                    ascii_out += a
                     offset += consumed
-                out += f"{spacing}>\n"
-                return out, ptr + offset
+                ascii_out += f"{spacing}>\n"
+                return hex_out, ascii_out, ptr + offset
             
-            # 일반 데이터 아이템 처리
+            # 일반 데이터 아이템
             val_data = data[ptr:ptr+length]
+            header_hex = data[:ptr].hex(' ').upper()
+            val_hex = val_data.hex(' ').upper()
             val_ascii = cls.to_readable_str(val_data)
             
-            # 주석 기호(*) 필터링 (ASCII 타입인 경우)
+            # 주석 기호(*) 필터링 (ASCII 타입 시)
             if fmt_name == "A" and '*' in val_ascii:
                 val_ascii = val_ascii.split('*')[0].strip()
 
-            return f"{spacing}<{fmt_name} '{val_ascii}'>\n", ptr + length
+            hex_line = f"{spacing}{header_hex} | {val_hex}\n"
+            ascii_line = f"{spacing}<{fmt_name} '{val_ascii}'>\n"
+            
+            return hex_line, ascii_line, ptr + length
         except Exception:
-            return f"{spacing}[Parse Error at {data[:10].hex()}]\n", len(data)
+            return f"HEX DUMP: {data.hex(' ').upper()}\n", f"ASCII DUMP: {cls.to_readable_str(data)}\n", len(data)
 
 # --- [2. HSMS Instance & Protocol Logic] ---
 class HSMSInstance(QObject):
@@ -104,11 +104,10 @@ class HSMSInstance(QObject):
 
     def handle_secs_message(self, header, payload):
         """행 분리 및 구조체 유지 출력 핸들러"""
-        hex_view = SECSParser.wrap_hex(payload)
-        ascii_struct, _ = SECSParser.parse_recursive(payload)
+        hex_struct, ascii_struct, _ = SECSParser.parse_recursive(payload)
         
-        msg = f"● RECV [S{header.stream}F{header.function}] SysByte:{header.system_bytes:08X}\n"
-        msg += "--- HEX RAW VIEW ---\n" + hex_view + "\n\n"
+        msg = f"● RECV [S{header.stream}F{header.function}] SystemBytes: {header.system_bytes:08X}\n"
+        msg += "--- HEX CODE VIEW ---\n" + hex_struct
         msg += "--- STRUCTURE VIEW ---\n" + ascii_struct
         msg += "--------------------------------------"
         self.log_signal.emit(msg)
@@ -123,18 +122,18 @@ class HSMSInstance(QObject):
         self._sys_byte = (self._sys_byte + 1) % 0xFFFFFFFF
         header.system_bytes = self._sys_byte
         
-        # 전송 시 주석(*) 처리 로직
-        clean_lines = []
+        filtered_lines = []
         for line in payload_text.splitlines():
             clean_line = line.split('*')[0].strip()
-            if clean_line: clean_lines.append(clean_line)
+            if clean_line: filtered_lines.append(clean_line)
         
-        final_payload = "\n".join(clean_lines).encode('utf-8')
+        final_payload_text = "\n".join(filtered_lines)
+        payload = final_payload_text.encode('utf-8')
 
         if self.transport:
-            full = header.pack() + final_payload
+            full = header.pack() + payload
             self.transport.write(struct.pack(">I", len(full)) + full)
-            self.log_signal.emit(f"○ SEND [S{s}F{f}] Body: {final_payload.decode('utf-8', errors='ignore')}")
+            self.log_signal.emit(f"○ SEND [S{s}F{f}] Body: {final_payload_text}")
         else:
             self.log_signal.emit("ERROR | Not Connected")
 
@@ -163,8 +162,8 @@ class HSMSInstance(QObject):
         header.system_bytes = self._sys_byte
         f = asyncio.get_running_loop().create_future()
         self._pending_tx[self._sys_byte] = f
+        msg = header.pack()
         if self.transport:
-            msg = header.pack()
             self.transport.write(struct.pack(">I", len(msg)) + msg)
             return await asyncio.wait_for(f, timeout)
         raise Exception("Lost Transport")
@@ -202,11 +201,13 @@ class HSMSProtocol(asyncio.Protocol):
 class HSMSMonitorApp(QMainWindow):
     def __init__(self, loop):
         super().__init__()
-        self.sessions, self.loop, self.current_node_name = {}, loop, None
+        self.sessions = {}
+        self.loop = loop
+        self.current_node_name = None
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("HSMS Master v2.5.4 (Restore) - Structural View")
+        self.setWindowTitle("HSMS Master v2.5.4 - Structured Viewer")
         self.resize(1100, 900)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
@@ -225,20 +226,28 @@ class HSMSMonitorApp(QMainWindow):
         f_lay.addRow("Mode:", mode_h); f_lay.addRow("IP/Port:", self.in_host); f_lay.addRow("", self.in_port)
         cfg_box.setLayout(f_lay)
 
+        t_box = QGroupBox("T-Parameters")
+        t_lay = QGridLayout()
+        self.t_inputs = {k: QLineEdit(str(v)) for k, v in {'T3':45, 'T5':10, 'T6':5, 'T7':10, 'T8':5}.items()}
+        for i, (k, w) in enumerate(self.t_inputs.items()):
+            t_lay.addWidget(QLabel(f"{k}:"), i//2, (i%2)*2)
+            t_lay.addWidget(w, i//2, (i%2)*2+1)
+        t_box.setLayout(t_lay)
+
         btn_apply = QPushButton("Apply Config"); btn_apply.clicked.connect(self.apply_node)
         btn_start = QPushButton("START"); btn_start.setStyleSheet("background:#2980b9; color:white; font-weight:bold;")
         btn_start.clicked.connect(self.start_comm)
         btn_stop = QPushButton("STOP"); btn_stop.setStyleSheet("background:#c0392b; color:white; font-weight:bold;")
         btn_stop.clicked.connect(self.stop_comm)
 
-        self.st_lbl = QLabel("NOT CONNECTED"); self.st_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.st_lbl.setMinimumHeight(45)
-        self.st_lbl.setStyleSheet("background:#34495e; color:#ecf0f1; font-weight:bold; border-radius:5px;")
-
-        left_panel.addWidget(cfg_box); left_panel.addWidget(btn_apply); left_panel.addWidget(btn_start)
-        left_panel.addWidget(btn_stop); left_panel.addWidget(self.st_lbl); left_panel.addStretch()
+        self.st_nc, self.st_ns, self.st_sl = self._st_lbl("NOT CONNECTED"), self._st_lbl("NOT SELECTED"), self._st_lbl("SELECTED")
+        left_panel.addWidget(cfg_box); left_panel.addWidget(t_box); left_panel.addWidget(btn_apply)
+        left_panel.addWidget(btn_start); left_panel.addWidget(btn_stop); left_panel.addWidget(self.st_nc)
+        left_panel.addWidget(self.st_ns); left_panel.addWidget(self.st_sl); left_panel.addStretch()
 
         right_panel = QVBoxLayout()
         send_group = QGroupBox("Message Transmission")
+        send_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed) 
         s_lay = QVBoxLayout()
         h_lay = QHBoxLayout()
         self.in_s, self.in_f = QLineEdit("1"), QLineEdit("1")
@@ -253,7 +262,7 @@ class HSMSMonitorApp(QMainWindow):
         l_lay = QVBoxLayout()
         self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:'Consolas', monospace; font-size:9pt;")
+        self.log_view.setStyleSheet("background:#121212; color:#00ff00; font-family:Consolas; font-size:9pt;")
         l_lay.addWidget(self.log_view)
         log_group.setLayout(l_lay)
 
@@ -261,28 +270,43 @@ class HSMSMonitorApp(QMainWindow):
         main_layout.addLayout(left_panel, 1); main_layout.addLayout(right_panel, 3)
         self.setCentralWidget(main_widget)
 
+    def _st_lbl(self, txt):
+        l = QLabel(txt); l.setAlignment(Qt.AlignmentFlag.AlignCenter); l.setMinimumHeight(40)
+        l.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain); l.setStyleSheet("background:#34495e; color:#7f8c8d;")
+        return l
+
     def apply_node(self):
-        name = self.in_name.text()
-        if not name: return
-        mode = "Active" if self.rb_act.isChecked() else "Passive"
-        if name not in self.sessions:
-            inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode)
-            inst.status_changed.connect(self.update_state_ui)
-            inst.log_signal.connect(lambda m: self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}"))
-            self.sessions[name] = inst; self.combo_nodes.addItem(name)
-        self.log_view.append(f"UI | Node '{name}' Configured.")
+        try:
+            name, mode = self.in_name.text(), ("Active" if self.rb_act.isChecked() else "Passive")
+            if not name: return
+            params = {k: float(w.text()) for k, w in self.t_inputs.items()}
+            if name not in self.sessions:
+                inst = HSMSInstance(name, self.in_host.text(), int(self.in_port.text()), mode, params)
+                inst.status_changed.connect(self.update_state_ui); inst.log_signal.connect(self._safe_log)
+                self.sessions[name] = inst; self.combo_nodes.addItem(name)
+            else: self.sessions[name].mode, self.sessions[name].params = mode, params
+            self.log_view.append(f"UI | Node '{name}' Configured.")
+        except Exception as e: self.log_view.append(f"UI ERROR | {e}")
+
+    def _safe_log(self, m):
+        self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
 
     def on_node_selected(self, idx):
         if idx <= 0: return
         name = self.combo_nodes.currentText(); self.current_node_name = name; inst = self.sessions[name]
         self.in_name.setText(name); self.in_host.setText(inst.host); self.in_port.setText(str(inst.port))
+        self.rb_act.setChecked(inst.mode == "Active"); self.rb_pas.setChecked(inst.mode == "Passive")
+        for k, v in inst.params.items(): self.t_inputs[k].setText(str(v))
         self.update_state_ui(name, inst.current_state)
 
     def update_state_ui(self, name, status):
+        if name in self.sessions: self.sessions[name].current_state = status
         if name != self.current_node_name: return
-        self.st_lbl.setText(status)
-        color = "#2ecc71" if status == "SELECTED" else "#f1c40f" if status == "CONNECTED" else "#e74c3c"
-        self.st_lbl.setStyleSheet(f"background:{color}; color:#000; font-weight:bold; border-radius:5px;")
+        off, on = "background:#34495e; color:#7f8c8d;", "background:#2ecc71; color:#000; font-weight:bold;"
+        self.st_nc.setStyleSheet(off); self.st_ns.setStyleSheet(off); self.st_sl.setStyleSheet(off)
+        if status == "SELECTED": self.st_sl.setStyleSheet(on)
+        elif status == "NOT SELECTED": self.st_ns.setStyleSheet(on)
+        else: self.st_nc.setStyleSheet(on)
 
     def send_message_action(self):
         if self.current_node_name:
