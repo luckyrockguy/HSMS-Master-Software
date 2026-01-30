@@ -170,9 +170,9 @@ class HSMSInstance(QObject):
                     for _ in range(length):
                         child_items, offset = decode_items(data, offset)
                         children.extend(child_items)
-                    items.append(f"<L[{length}]")
+						
+                    items.append(f"<L[{length}]>")
                     items.extend(children)
-                    items.append(">")
                 else:
                     if offset + length > len(data):
                         break
